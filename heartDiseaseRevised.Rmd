@@ -1,0 +1,797 @@
+---
+title: "Heart Disease Classification - Revisited"
+author: "Team 3"
+date: '2023-07-03'
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+0. Import relevant libraries
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ROCR)
+library(irr)
+library(C50)
+library(caret)
+library(e1071)
+library(ranger)
+library(parallel)
+library(doParallel)
+library(pROC)
+library(readxl)
+library(rpart)
+library(rpart.plot)
+library(e1071)
+library(reshape2)
+
+#Set global options to nonscientific notation
+options(scipen = 999)
+
+```
+
+1. Convert XPT file to csv
+
+```{r}
+
+#This is only done once so I will comment it out 
+#Library for converting .XPT to .CSV
+#library(foreign)
+
+#Read in .XPT file
+#heart <- read.xport("/Users/paige/temp/heartDiseaseDM/LLCP2021.XPT ")
+
+#Write to .CSV
+#write.csv(file = "heartData2021.csv", heart, row.names=FALSE)
+
+```
+
+2. Import data set
+
+```{r}
+
+#Read in .CSV file
+heart <- read.csv("heartData2021.csv")
+heart2 <- read.csv("heartData2021.csv")
+```
+
+3. Data pre-processing
+
+a)  Initial dimensionality reduction
+- Removed all non-core questions (irrelevant attributes)
+- Removed redundant attributes (calculations from other variables, other than BMI and age)
+- Removed any introductory questions (irrelevant attributes)
+- Removed any variables who had greater than 50% of the values missing 
+
+```{r}
+
+#Remove all non-core questions
+#Exception X_AGE_G because there is not a non-calculated field that displays raw aged. These are imputed in six groups.
+#Exception X_BMI5CAT to replace weight/height rather than manually calculating
+#Exception X_MICHD because CDC has combined CVDINFR4 (myocardial infarction) and CVDCRHD4 (coronary heart disease) - target variable
+heart <- heart[,c(1:97,247,265,270)]
+
+#Remove columns that are introductory and calculated fields
+heart <- heart[,-c(2:31)]
+
+#Remove height and weight variables since BMI will be used instead
+heart <- heart %>% select(-c(WEIGHT2, HEIGHT3))
+
+#CVDINFR4 (myocardial infarction) and CVDCRHD4 (coronary heart disease) since these are a derivation of X_MICHD
+heart <- heart %>% select(-c(CVDINFR4, CVDCRHD4))
+
+#Calculate proportion of NA values by variable
+naPercentages <- sort((colMeans(is.na(heart))) * 100, decreasing = TRUE)
+
+#Select all that have a proportion missing > 50
+lowProportionVars <- names(which(naPercentages > 50))
+
+#Remove high proportion missing from dataset
+heart <- heart[, !(names(heart) %in% lowProportionVars)]
+
+#Remove rows that have target class missing
+heart <- heart[complete.cases(heart$X_MICHD), ]
+
+str(heart)
+```
+b) Data cleaning 
+
+```{r}
+
+#Convert everything but numeric variables to character
+numericVars <- c("POORHLTH","PHYSHLTH","MENTHLTH","CPDEMO1B","ALCDAY5")
+
+heart <- heart %>%
+  mutate_at(vars(-one_of(numericVars)), as.character)
+
+str(heart)
+
+```
+
+The majority of the features in this data set are coded responses and will need to be converted to their code descriptions prior so it is easier to interpret findings. Since there are so many variables to change I have used the file Format21.sas to match the descriptions to the codes in mass.
+
+Cleanup of code file:
+
+```{r}
+
+#Read in SAS code dataset
+codeFile <- read_excel("heartDiseaseSASCodes.xlsx", sheet = "Sheet1")
+
+#Rename column
+colnames(codeFile)[1] <- "Column"
+
+#Create a new column to store the values starting with a letter (the variable name rows)
+codeFile$varNames <- NA
+
+#Iterate over each row in the data frame
+for (i in 1:nrow(codeFile)) {
+  
+  #Convert value to character for regex
+  value <- as.character(codeFile$Column[i])
+  
+  #Check if the value starts with a letter
+  if (grepl("^[A-Za-z]", value)) {
+    #If starts with a letter, then move the variable to a new column
+    codeFile$varNames[i] <- value
+    codeFile$Column[i] <- NA
+  }
+}
+
+#Fill in variable names in spaces between two variables
+codeFile <- fill(codeFile, varNames)
+
+#Remove any rows with NA
+codeFile <- codeFile[complete.cases(codeFile), ]
+
+#Subset data to remove any rows with ; 
+codeFile <- subset(codeFile, Column != ";")
+
+#Split the column into two columns according to the = sign
+splitColumn <- strsplit(codeFile$Column, "=")
+
+# Creating separate columns for values and descriptions
+codeFile$codeVal <- sapply(splitColumn, "[", 1)
+codeFile$codeDesc <- sapply(splitColumn, "[", 2)
+
+#Remove " from code description
+codeFile$codeDesc <- gsub("\"", "", codeFile$codeDesc)
+
+#Remove . from code value
+codeFile$codeVal <- gsub("\\.", "", codeFile$codeVal)
+
+#Remove spaces from code value
+codeFile$codeVal <- gsub("\\s", "", codeFile$codeVal)
+
+#Remove trailing white space from code description
+codeFile$codeDesc <- trimws(codeFile$codeDesc)
+
+#Select only data that has numbers as code value
+codeFile <- subset(codeFile, !(codeVal %in% c("D", "R", "")))
+
+#Remove original column
+codeFile <- codeFile[,-1]
+
+#Some of the variable names in the code file do not match what's in the dataset
+#I renamed them manually
+codeFile$varNames <- recode(codeFile$varNames,"AD3DEPEV"="ADDEPEV3", "ALC5DAY"="ALCDAY5", "ALC5DAY"="ALCDAY5", "AST3HMA"="ASTHMA3", "BP6HIGH"="BPHIGH6", "CHC3COPD"="CHCCOPD3", "CHC2KDNY"="CHCKDNY2", "CHECK1UP"="CHECKUP1", "CHOL3CHK"="CHOLCHK3", "CHOL3MED"="CHOLMED3", "CP1DEMO"="CPDEMO1B", "CVD4CRHD"="CVDCRHD4", "CVD4INFR"="CVDINFR4", "CVD3STRK"="CVDSTRK3", "DIA4BETE"="DIABETE4", "ECIG1NOW"="ECIGNOW1", "EMPLOY1F"="EMPLOY1", "EXER2ANY"="EXERANY2", "FLU7SHOT"="FLUSHOT7", "FRENCH1F"="FRENCHF1", "FRUIT2F"="FRUIT2", "FRUIT2JU"="FRUITJU2", "FV1GREEN"="FVGREEN1", "HAV5ARTH"="HAVARTH5", "HEIGHT"="HEIGHT3", "HIV7TST"="HIVTST7", "IN3COME"="INCOME3", "MED1COST"="MEDCOST1", "PERS3DOC"="PERSDOC3", "PNEU4VAC"="PNEUVAC4", "RENT1HOM"="RENTHOM1", "SMOK100_"="SMOKE100", "TOLD3HI"="TOLDHI3", "USE3NOW"="USENOW3", "VEGE2TAB"="VEGETAB2", "VET3ERAN"="VETERAN3", "WEIGHT"="WEIGHT2")
+
+```
+
+Recode all categorical coded responses in the heart dataset: 
+
+```{r}
+#Object for all variable names in reduced heart dataset
+allValues <- as.list(names(heart))
+
+#Remove the numerical variables from the coding 
+allValues <- setdiff(allValues, numericVars)
+
+#Loop through each variable name in the heart dataset
+for (var in allValues) {
+  #Loop through each row of the codeFile dataset
+  for (i in 1:nrow(codeFile)) {
+    #Check if the value in the first column of the code file matches the variable of the heart dataset 
+    if (codeFile[i, 1] == var) {
+      # Output values from the second and third columns of the codefile (the code value and description)
+      outputValue1 <- as.character(codeFile[i, 2])
+      outputValue2 <- as.character(codeFile[i, 3])
+      #Replace all coded values 
+      heart[[var]][heart[[var]] == outputValue1] <- outputValue2
+    }
+  }
+}
+
+```
+
+Manual recode of three calculated variables since these variables are not in the code file: 
+
+```{r}
+
+#Code X_AGE_G manually because this is a calculated variable and is not in the code file
+heart$X_AGE_G <- recode(heart$X_AGE_G,"1" = "Age 18 to 24", "2" = "Age 25 to 34", "3" = "Age 35 to 44","4" = "Age 45 to 54", "5" = "Age 55 to 64","6" = "Age 65 or older")
+
+#Code X_BMI5CAT manually because this is a calculated variable and is not in the code file
+heart$X_BMI5CAT <- recode(heart$X_BMI5CAT,"1" = "Underweight", "2" = "Normal weight", "3" = "Overweight","4" = "Obese")
+
+#Code X_MICHD manually because this is a calculated variable and is not in the code file
+heart$X_MICHD <- recode(heart$X_MICHD,"1" = "Reported having MI or CHD", "2" = "Did not report having MI or CHD")
+
+```
+
+3. Imputation of missing values
+
+Every feature with categorical values has been imputed using mode that is either:
+
+A) Grouped by another feature if there is variation between groups age, sex, or region
+B) Mode of entire feature if there is no noticeable variation between groups age, sex, or region
+
+If numerical feature, either median or mean used depending on data distribution, grouped by either age, sex, region
+
+```{r}
+
+#mode function - will be used for imputation
+getmode <- function(v) {
+   uniqv <- unique(na.omit(v))
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+```
+
+Discretization: New column added for regions of the US and state removed
+
+```{r}
+
+#X_STATE -  State FIPS Code
+round(prop.table(table(heart$X_STATE, useNA = "always")) * 100, 2)
+
+#New column for regions of US
+heart$X_REGION <- ifelse(heart$X_STATE %in% c("9","23","25","33","44","50","34","36","42"),"Northeast",
+                        ifelse(heart$X_STATE %in% c("17","18","26","39","55","19","20","27","29","31","38","46"), "Midwest",
+                               ifelse(heart$X_STATE %in% c("10","13","24","37","45","51","11","54","1","21","28","47","5","22","40","48"), "South",
+                                      ifelse(heart$X_STATE %in% c("4","8","16","30","32","35","49","56","2","6","15","41","53"), "West",
+                                        "Territories"))))
+
+round(prop.table(table(heart$X_REGION, useNA = "always")) * 100, digits = 1)
+
+#Remove state variable
+heart <- heart %>% select(-X_STATE)
+
+```
+
+Imputation of categorical features using mode:
+
+Rules:
+If the missing values are less than 1%, then just use the mode of the entire variable
+If the missing values are >1%, use mode grouped by region, age, or gender, whichever shows any variance in mode. If none show variance then use the mode of the entire variable.
+If more then one grouping shows variance, verify which one shows the most variance and use 
+
+```{r}
+
+#Select all categorical features
+characterColumns <- heart %>% select_if(is.character)
+
+#Set percentage of missing values
+naPercentages <- sort((colMeans(is.na(characterColumns))) * 100, decreasing = TRUE)
+
+#Variable with less than 1% missing
+onePercent <- names(which(naPercentages < 1))
+
+#Loop through every variable that has <1% missing and replace NA with mode
+for (var in onePercent) {
+  #Loop through each row of the codeFile dataset
+  heart <- heart %>% mutate(!!var := ifelse(is.na(!!sym(var)),getmode(!!sym(var)), !!sym(var)))
+}
+
+#Select all categorical features
+characterColumns <- heart %>% select_if(is.character)
+
+#Calculate percentages of missing values
+naPercentages <- sort((colMeans(is.na(characterColumns))) * 100, decreasing = TRUE)
+
+#Everything that has missing values selected
+toImpute <- names(which(naPercentages > 0))
+
+#Create empty data frame to store the results
+whatsLeft <- data.frame()
+
+#Loop through every variable to find modes grouped by age, sex, region
+for (var in toImpute) {
+
+#Calculate modes grouped by age, sex, region
+modeCalcAge <- heart %>% group_by(X_AGE_G) %>% summarise(mode = getmode(!!sym(var)))
+modeCalcGender <- heart %>% group_by(SEXVAR) %>% summarise(mode = getmode(!!sym(var)))
+modeCalcRegion <- heart %>% group_by(X_REGION) %>% summarise(mode = getmode(!!sym(var)))
+
+#If the modes are all the same, then mark as "no variance", else "variance"
+modeVarAge <- ifelse(length(unique(modeCalcAge$mode)) == 1,"No variance","Variance")
+modeVarGender <- ifelse(length(unique(modeCalcGender$mode)) == 1,"No variance","Variance")
+modeVarRegion <- ifelse(length(unique(modeCalcRegion$mode)) == 1,"No variance","Variance")
+
+variances <- data.frame(Var = var, Age = modeVarAge, Gender = modeVarGender, Region = modeVarRegion)
+
+#If all the modes show no variance, then use mode of the entire variable
+if (modeVarAge == "No variance" && modeVarGender == "No variance" && modeVarRegion == "No variance") 
+  {
+    heart <- heart %>% mutate(!!var := ifelse(is.na(!!sym(var)),getmode(!!sym(var)), !!sym(var)))
+  } 
+
+#If age shows variance, use age
+else if(modeVarAge == "Variance" && modeVarGender == "No variance" && modeVarRegion == "No variance")
+  {
+    heart <- heart %>% group_by(X_AGE_G) %>% mutate(!!var := ifelse(is.na(!!sym(var)),getmode(!!sym(var)), !!sym(var)))
+}
+
+#Add whatever is left to a data frame
+else 
+  {
+    whatsLeft <- rbind(whatsLeft, variances)
+  }
+}
+
+#Print data frame
+print(whatsLeft)
+
+#Manual correction of final three categorical variables
+#FLUSHOT7
+heart %>% group_by(X_AGE_G) %>% summarise(mode = getmode(FLUSHOT7))
+heart %>% group_by(SEXVAR) %>% summarise(mode = getmode(FLUSHOT7))
+heart %>% group_by(X_REGION) %>% summarise(mode = getmode(FLUSHOT7))
+heart <- heart %>% group_by(X_AGE_G) %>% mutate(FLUSHOT7 = ifelse(is.na(FLUSHOT7),getmode(FLUSHOT7), FLUSHOT7))
+
+#INCOME3
+heart %>% group_by(X_AGE_G) %>% summarise(mode = getmode(INCOME3))
+heart %>% group_by(SEXVAR) %>% summarise(mode = getmode(INCOME3))
+heart %>% group_by(X_REGION) %>% summarise(mode = getmode(INCOME3))
+heart <- heart %>% group_by(X_AGE_G) %>% mutate(INCOME3 = ifelse(is.na(INCOME3),getmode(INCOME3), INCOME3))
+
+#X_BMI5CAT
+heart %>% group_by(X_AGE_G) %>% summarise(mode = getmode(X_BMI5CAT))
+heart %>% group_by(SEXVAR) %>% summarise(mode = getmode(X_BMI5CAT))
+heart %>% group_by(X_REGION) %>% summarise(mode = getmode(X_BMI5CAT))
+heart <- heart %>% group_by(X_AGE_G) %>% mutate(X_BMI5CAT = ifelse(is.na(X_BMI5CAT),getmode(X_BMI5CAT), X_BMI5CAT))
+```
+
+Recode numerical variables:
+There are not many numerical variables but each have to be addresses differently because they have different codings.
+
+```{r}
+
+#POORHLTH, PHYSHLTH and MENTHLTH all have the same values 1-30, Refused, Don't know, or Blank
+daysVariables <- c("POORHLTH","PHYSHLTH","MENTHLTH")
+
+#Loop through three variable to replace with values
+for (var in daysVariables) {
+  heart <- heart %>% mutate(!!var := ifelse(!!sym(var) == 88, 0, ifelse(!!sym(var) == 77 | !!sym(var) == 99,NA,!!sym(var))))
+}
+
+#Verify conversion
+table(heart$POORHLTH, useNA = "always")
+table(heart$PHYSHLTH, useNA = "always")
+table(heart$MENTHLTH, useNA = "always")
+
+#CPDEMO1B - replace 7, 8, 9 with NA or 0
+heart <- heart %>% mutate(CPDEMO1B = ifelse(CPDEMO1B == 8, 0, ifelse(CPDEMO1B == 7 | CPDEMO1B == 9, NA, CPDEMO1B)))
+
+#Verify conversion
+table(heart$CPDEMO1B, useNA = "always")
+
+#Create a new variable called DRINKSYEARLY that calculates number of drinks per year based on ALCDAY5
+heart <- heart %>% mutate(DRINKSYEARLY = ifelse(ALCDAY5 <= 107 & ALCDAY5 >= 101, (ALCDAY5 %% 100)*52,
+                                           ifelse(ALCDAY5 <= 230 & ALCDAY5 >= 201, (ALCDAY5 %% 200)*12,
+                                           ifelse(ALCDAY5 == 777 | ALCDAY5 == 999, NA, 
+                                                  ifelse(ALCDAY5 == 888, 0, ALCDAY5)))))
+
+#Remove ALCDAY5 since I made a calculated variable
+heart <- heart %>% select(-ALCDAY5)
+str(heart)
+```
+
+Impute numerical variables:
+
+```{r}
+
+medianMean <- function(var) {
+print(heart %>% group_by(X_AGE_G) %>% summarise(mean = mean(!!sym(var), na.rm = TRUE), median = median(!!sym(var), na.rm = TRUE)))
+print(heart %>% group_by(SEXVAR) %>% summarise(mean = mean(!!sym(var), na.rm = TRUE), median = median(!!sym(var), na.rm = TRUE)))
+print(heart %>% group_by(X_REGION) %>% summarise(mean = mean(!!sym(var), na.rm = TRUE), median = median(!!sym(var), na.rm = TRUE)))
+}
+
+medianMean("POORHLTH")
+medianMean("PHYSHLTH")
+medianMean("MENTHLTH")
+medianMean("DRINKSYEARLY")
+medianMean("CPDEMO1B")
+
+heart <- heart %>% group_by(X_AGE_G) %>% mutate(POORHLTH = ifelse(is.na(POORHLTH), round(mean(POORHLTH, na.rm = TRUE)), POORHLTH))
+heart <- heart %>% group_by(X_AGE_G) %>% mutate(PHYSHLTH = ifelse(is.na(PHYSHLTH), round(mean(PHYSHLTH, na.rm = TRUE)), PHYSHLTH))
+heart <- heart %>% group_by(X_AGE_G) %>% mutate(MENTHLTH = ifelse(is.na(MENTHLTH), round(mean(MENTHLTH, na.rm = TRUE)), MENTHLTH))
+heart <- heart %>% group_by(X_AGE_G) %>% mutate(DRINKSYEARLY = ifelse(is.na(DRINKSYEARLY), median(DRINKSYEARLY, na.rm = TRUE), DRINKSYEARLY))
+heart <- heart %>% mutate(CPDEMO1B = ifelse(is.na(CPDEMO1B),round(mean(CPDEMO1B, na.rm = TRUE)), CPDEMO1B))
+
+```
+
+Verify no missing values:
+
+```{r}
+#Count number of rows in dataset
+nrow(heart)
+
+#Count number of rows without missing values
+nrow(heart[complete.cases(heart),])
+
+```
+
+4. Dimensionality Reduction Using Decision Tree
+
+```{r}
+#Turn characters into factors
+heartModeling <- heart %>% mutate_if(is.character, as.factor)
+heartModeling$X_AGE_G <- as.factor(heartModeling$X_AGE_G)
+
+#Verify changes
+str(heartModeling)
+
+#Check proportion of X_MICHD
+prop.table(table(heartModeling$X_MICHD))
+
+#Build the simplest decision tree splitting target class 50/50
+heartDTModelSimple <- rpart(X_MICHD ~ ., data = heartModeling, parms=list(prior=c(.5,.5)), method = 'class')
+
+#Display tree
+rpart.plot(heartDTModelSimple)
+rpart.plot(heartDTModelSimple, text = TRUE, fallen.leaves = TRUE, fallen.col = "white", fallen.text.col.fill = "black")
+
+#View summary of model
+heartDTModelSimpleSummary <- summary(heartDTModelSimple)
+
+#Select variables of importance in decision tree
+modelColumns <- names(heartDTModelSimpleSummary$variable.importance)
+
+#Add on the target variables 
+modelColumns <- c(modelColumns,"X_MICHD")
+
+#Create new data frame of selected variables for training models
+heartModelSmall <- heartModeling[, names(heartModeling) %in% modelColumns]
+
+```
+
+4. Split data into training and test sets
+
+```{r}
+
+#Number of test set 25%
+rowN <- nrow(heartModelSmall)
+testRowN <- rowN*.25
+
+#Sample numbers for test set
+set.seed(123)
+heartSample <- sample(rowN, testRowN)
+
+#25% Test Set 
+heartTest <- heartModelSmall[heartSample,]
+
+#75% Training Set
+heartTrain <- heartModelSmall[-heartSample,]
+
+#Verify proportions
+prop.table(table(heartTest$X_MICHD))
+prop.table(table(heartTrain$X_MICHD))
+
+```
+
+5. Modeling
+
+Model 1: Naive Bayes 
+
+```{r}
+
+heartModel_1 <- naiveBayes(X_MICHD ~ .,
+                           data = heartTrain)
+
+#Evaluate model performance
+heartPred_1 <- predict(heartModel_1, heartTest)
+
+#Confusion matrix 
+results_1 <- confusionMatrix(data=heartPred_1,
+                             reference = heartTest$X_MICHD,
+                             positive = "Reported having MI or CHD")
+
+#Showing only Kappa
+results_1$overall['Kappa']
+
+```
+
+Model 2: Random Forest 
+
+```{r}
+
+ctrl <- trainControl(method = "cv", sampling = "up", selectionFunction = "oneSE", savePredictions = T)
+ctrl
+
+gridRf <- expand.grid(mtry = 20, splitrule = 'hellinger', min.node.size = 1)
+gridRf
+
+set.seed(300)
+heartModel_2L <- train(X_MICHD ~ .,
+                        data = heartTrain,
+                        method = "ranger",
+                        metric = "Kappa",
+                        tuneGrid = gridRf,
+                        trControl = ctrl)
+
+#Display model
+heartModel_2L
+
+#Evaluate model performance
+heartPred_2L <- predict(heartModel_2L, heartTest)
+
+#Confusion matrix 
+results_2L <- confusionMatrix(data=heartPred_2L,
+                             reference = heartTest$X_MICHD,
+                             positive = "Reported having MI or CHD")
+
+results_2L
+
+#Showing only kappa
+results_2L$overall['Kappa']
+
+```
+
+Model 3: Bagging
+
+```{r}
+
+ctrl <- trainControl(method = "cv", sampling = "up", selectionFunction = "oneSE", savePredictions = T)
+
+#cntrl grid
+gridBag <- expand.grid(vars = seq(2,16, by = 2))
+gridBag
+
+bagCtrl <- bagControl(fit = ldaBag$fit,
+                      predict = ldaBag$pred,
+                      aggregate = ldaBag$aggregate)
+set.seed(300)
+heartModel_3 <- train(X_MICHD ~ .,
+                        data = heartTrain,
+                        method = "bag",
+                        metric = "Kappa",
+                        tuneGrid = gridBag,
+                        bagControl = bagCtrl,
+                        trControl = ctrl)
+
+#Display model
+heartModel_3
+
+#Evaluate model performance
+heartPred_3 <- predict(heartModel_3, heartTest)
+
+#Confusion matrix 
+results_3 <- confusionMatrix(data=heartPred_3,
+                             reference = heartTest$X_MICHD,
+                             positive = "Reported having MI or CHD")
+
+results_3
+
+#Showing only kappa
+results_3$overall['Kappa']
+
+```
+
+Model 4: Logistic Regression 
+
+```{r}
+ctrl <- trainControl(method = "cv", sampling = "up", selectionFunction = "oneSE", savePredictions = T)
+
+#cntrl grid
+gridLog <- expand.grid(nIter = c(50,100,150,200))
+gridLog
+
+set.seed(300)
+heartModel_4 <- train(X_MICHD ~ .,
+                        data = heartTrain,
+                        method = "LogitBoost",
+                        metric = "Kappa",
+                        tuneGrid = gridLog,
+                        trControl = ctrl)
+
+#Display model
+heartModel_4
+
+#Evaluate model performance
+heartPred_4 <- predict(heartModel_4, heartTest)
+
+#Confusion matrix 
+results_4 <- confusionMatrix(data=heartPred_4,
+                             reference = heartTest$X_MICHD,
+                             positive = "Reported having MI or CHD")
+
+results_4
+
+#Showing only kappa
+results_4$overall['Kappa']
+
+```
+
+
+Model 5: Decision Tree
+
+```{r}
+
+ctrl <- trainControl(method = "cv", sampling = "up", selectionFunction = "oneSE", savePredictions = T)
+
+#cntrl grid
+gridTree <- expand.grid(.model = "tree", .trials = c(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21), .winnow = TRUE)
+gridTree
+
+
+
+set.seed(300)
+heartModel_5 <- train(X_MICHD ~ .,
+                        data = heartTrain,
+                        method = "C5.0",
+                        metric = "Kappa",
+                        tuneGrid = gridTree,
+                        trControl = ctrl)
+
+#Display model
+heartModel_5
+
+#Evaluate model performance
+heartPred_5 <- predict(heartModel_5, heartTest)
+
+#Confusion matrix 
+results_5 <- confusionMatrix(data=heartPred_5,
+                             reference = heartTest$X_MICHD,
+                             positive = "Reported having MI or CHD")
+
+results_5
+
+#Showing only kappa
+
+results_5$overall['Kappa']
+
+```
+
+6. Plots
+
+a. Heart disease by age plot
+
+```{r}
+
+heartDiseaseVsAge <- ggplot(data = heart, aes(x = X_AGE_G)) + 
+  geom_bar(aes(y = (..count..)/sum(..count..), fill = X_MICHD), position = 'stack') + 
+  labs(x = 'Age', y = "Percentage of Respondents", title = 'Heart Disease - Distribution by Age') + 
+  scale_fill_manual(name = "Heart Disease", values = c('Did not report having MI or CHD' = 'pink','Reported having MI or CHD' = 'red', na.value = 'grey')) + 
+  scale_y_continuous(labels = scales::percent, breaks = seq(0,.4, by=  .05)) +
+  theme(aspect.ratio = 4/3, axis.text.x = element_text(angle = 25), legend.position = c(.4,.85),
+        legend.title = element_text(size = 6), legend.text = element_text(size = 6)) 
+heartDiseaseVsAge
+
+```
+
+b. Heart disease by region
+
+```{r}
+#Heart Disease by Region
+heartDiseaseVsRegion <- ggplot(data = heart, aes(x = X_REGION)) + 
+  geom_bar(aes(y = (..count..)/sum(..count..), fill = X_MICHD), position = 'stack') + 
+  labs(x = 'Region', y = "Percentage of Respondents", title = 'Distribution by Region') + 
+  scale_fill_manual(name = "Heart Disease", values = c('Did not report having MI or CHD' = 'pink','Reported having MI or CHD' = 'red', na.value = 'grey')) +  
+  scale_y_continuous(labels = scales::percent, breaks = seq(0,.4, by=  .05)) +
+  theme(aspect.ratio = 4/3, axis.text.x = element_text(angle = 30), legend.position = c(.4,.85),
+        legend.title = element_text(size = 6), legend.text = element_text(size = 6)) 
+heartDiseaseVsRegion
+
+```
+
+c. Model evaluation plots
+
+```{r}
+
+#Model names for plotting
+modelNames <- c('Naive Bayes', 'Random Forest', 'Bagging', 'Boosted Logistic Regression', 'Decision Tree')
+
+#Kappa values for each model
+kappaVals <- c(results_1$overall['Kappa'],results_2L$overall['Kappa'],results_3$overall['Kappa'],results_4$overall['Kappa'],results_5$overall['Kappa'])
+
+#Accuracy values for each model
+accuracyVals <-c(results_1$overall['Accuracy'],results_2L$overall['Accuracy'],results_3$overall['Accuracy'],results_4$overall['Accuracy'],results_5$overall['Accuracy'])
+
+#Sensitivity values for each model
+sensitivityVals <-c(results_1$byClass['Sensitivity'],results_2L$byClass['Sensitivity'],results_3$byClass['Sensitivity'],results_4$byClass['Sensitivity'],results_5$byClass['Sensitivity'])
+
+#Combined all three measurements
+modelDF <- data.frame(cbind(modelNames, kappaVals, accuracyVals, sensitivityVals))
+
+```
+
+```{r}
+
+par(mfrow = c(3,1))
+kappavsmodel <- ggplot() +
+  geom_point(data = modelDFOld, aes(x = modelNames, y = kappaValsOld, color = "Initial"), size = 6) +
+  geom_point(data = modelDF, aes(x = modelNames, y = kappaVals, color = "Enhanced"), size = 6) +
+  labs(x = 'Model Types', y = 'Kappa Value', title = "Kappa Values - Initial vs. Enhanced") +
+  scale_color_manual(values = c("Enhanced" = "pink", "Initial" = "red")) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+  theme(axis.text.x = element_text(size = 10), legend.position="bottom", legend.title = element_blank()) + 
+  scale_y_discrete(labels = function(x) sprintf("%.2f", as.numeric(x)))
+kappavsmodel
+
+#Accuracy model
+accuracyvsmodel <- ggplot() +
+  geom_point(data = modelDFOld, aes(x = modelNames, y = accuracyValsOld, color = "Initial"), size = 6) +
+  geom_point(data = modelDF, aes(x = modelNames, y = accuracyVals, color = "Enhanced"), size = 6) +
+  labs(x = 'Model Types', y = 'Accuracy Value', title = "Accuracy Values - Initial vs. Enhanced") +
+  scale_color_manual(values = c("Enhanced" = "pink", "Initial" = "red")) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+  theme(axis.text.x = element_text(size = 10), legend.position="bottom", legend.title = element_blank()) +
+  scale_y_discrete(labels = function(x) sprintf("%.2f", as.numeric(x)))
+accuracyvsmodel
+
+#Sensitivity model
+sensitivityvsmodel <- ggplot() +
+  geom_point(data = modelDFOld, aes(x = modelNames, y = sensitivityValsOld, color = "Initial"), size = 6) +
+  geom_point(data = modelDF, aes(x = modelNames, y = sensitivityVals, color = "Enhanced"), size = 6) +
+  labs(x = 'Model Types', y = 'Sensitivity Value', title = "Sensitivity Values - Initial vs. Enhanced") +
+  scale_color_manual(values = c("Enhanced" = "pink", "Initial" = "red")) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+  theme(axis.text.x = element_text(size = 10), legend.position="bottom", legend.title = element_blank()) + 
+  scale_y_discrete(labels = function(x) sprintf("%.2f", as.numeric(x)))
+sensitivityvsmodel
+
+combinedPlots <- grid.arrange(kappavsmodel, accuracyvsmodel, sensitivityvsmodel, ncol=3)
+
+```
+
+```{r}
+
+#Model Effectiveness Plot
+modelDF.m <- melt(modelDF, id.vars = 'modelNames')
+modelDF.m$variable = rep(c('Kappa','Accuracy','Sensitivity'),each = 5)
+ggplot(modelDF.m, aes(x = modelNames,y=value )) + 
+  geom_point(size = 5, aes(shape = variable, color = variable)) + 
+  labs(x = 'Model Types', y = 'Accuracy,Kappa,Sensitivity', title = "Model Effectiveness") +
+  theme(axis.text.x = element_text(angle = 60)) 
+
+```
+
+
+```{r oldValues}
+
+kappaValsOld <- c(0.1993979,0.1859396,0.2099951,0.3337035,0.2157214)
+accuracyValsOld <- c(0.7004823,0.8366964,0.7269975,0.8299875,0.8254812)
+sensitivityValsOld <- c(0.8142306,0.3753972,0.7675897,0.8306998,0.4681117)
+
+modelDFOld <- data.frame(cbind(modelNames,kappaValsOld,accuracyValsOld,sensitivityValsOld))
+
+#Model Effectiveness Plot
+modelDF.mOld <- melt(modelDFOld, id.vars = 'modelNames')
+modelDF.mOld$variable = rep(c('Kappa','Accuracy','Sensitivity'),each = 5)
+ggplot(modelDF.mOld, aes(x = modelNames,y=value )) + geom_point(size = 4,  aes(shape = variable, color = variable)) + labs(x = 'Model Types', y = 'Accuracy,Kappa,Sensitivity', title = "Model Effectiveness") 
+
+modelDFOldPlot <- ggplot() +
+  geom_point(data = modelDFOld, aes(x = modelNames, y = sensitivityValsOld, color = "Sensitivity"), size = 6) +
+  geom_point(data = modelDFOld, aes(x = modelNames, y = kappaValsOld, color = "Kappa"), size = 6) +
+  geom_point(data = modelDFOld, aes(x = modelNames, y = accuracyValsOld, color = "Accuracy"), size = 6) +
+  labs(x = 'Model Types', y = 'Value', title = "Original Modeling Results") +
+  scale_color_manual(values = c("Sensitivity" = "pink", "Kappa" = "red", "Accuracy" = "grey")) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+  theme(axis.text.x = element_text(size = 10), legend.position="bottom", legend.title = element_blank()) + 
+  scale_y_discrete(labels = function(x) sprintf("%.2f", as.numeric(x)))
+modelDFOldPlot
+
+```
+
+
+
+
+
